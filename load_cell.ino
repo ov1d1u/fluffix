@@ -5,6 +5,7 @@
 #include <PubSubClient.h>
 #include <HX711.h>
 #include <ArduinoJson.h>
+#include <SimpleKalmanFilter.h>
 
 String ssid;
 String password;
@@ -12,8 +13,8 @@ String mqtt_server;
 int mqtt_port = 0;
 
 // Calibration data
-const int tare_value = 1122; 
-const int max_value = 116;
+const float tareValue = 1000000; 
+const float maxValue = 1240000;
 
 const long interval = 1000;  // Counter value update interval
 unsigned long previousMillis = 0;
@@ -26,12 +27,13 @@ WiFiClient espClient;
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "ro.pool.ntp.org", 0, 86400000);  // 86400000ms = 24h
 PubSubClient mqttClient;
+SimpleKalmanFilter kf(82, 82, 0.01);
 
 HX711 scale(D3, D2);    // parameter "gain" is ommited; the default value 128 is used by the library
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Welcome to Fluffix 0.06!");
+  Serial.println("Welcome to Fluffix 0.10!");
   Serial.println("Begin initialization...");
   isConfigured = loadConfiguration();
   if (!isConfigured) return;
@@ -56,6 +58,7 @@ void setup() {
   Serial.println(WiFi.localIP());
   digitalWrite(BUILTIN_LED, HIGH);
   timeClient.begin();
+  kf.updateEstimate(tareValue);
 }
 
 void loop() {
@@ -71,33 +74,45 @@ void loop() {
     previousMillis = currentMillis;
     
     // Read values from sensor
-    long avg_value = scale.read_average(1) / 1000 - tare_value;
-    int value = double(avg_value)/double(max_value)*100;
-    if (value < 0) {
-      value = 0;
+    scale.power_up();
+    while (!scale.is_ready()) {
+      delay(100);
+    }
+    float rawValue = scale.read();
+    float estValue = kf.updateEstimate(rawValue);
+    //Serial.println(estValue);
+    int fillValue = (estValue - tareValue) / (maxValue - tareValue) * 100;
+    if (rawValue < 1000000.00) {
+      // Push some debug info
+      mqttClient.publish("sensors/water_bowl_level_raw", String(rawValue).c_str(), true);
+      mqttClient.publish("sensors/water_bowl_uptime", String(millis()).c_str());
+    }
+    if (fillValue < 0) {
+      fillValue = 0;
       isEmpty = true;
-    } else if (value > 100) {
-      value = 100;
+    } else if (fillValue > 100) {
+      fillValue = 100;
     }
 
-    if (isEmpty && value > 90) {
+    if (isEmpty && fillValue > 90) {
       // The bowl was refilled
       isEmpty = false;
       Serial.println("Publishing last refill timestamp on MQTT...");
-      mqttClient.publish("sensors/water_bowl_last_refill", String(timeClient.getEpochTime()).c_str());
+      mqttClient.publish("sensors/water_bowl_last_refill", String(timeClient.getEpochTime()).c_str(), true);
     }
 
 
-    if (value != oldValue) {
+    if (fillValue != oldValue) {
       // Value changed, notify broker
       // Send value over MQTT
       Serial.print("Publishing value on MQTT: ");
-      Serial.println(value);
-      mqttClient.publish("sensors/water_bowl_level", String(value).c_str());
+      Serial.println(fillValue);
+      mqttClient.publish("sensors/water_bowl_level", String(fillValue).c_str(), true);
       Serial.println("Done.");
     }
 
-    oldValue = value;
+    oldValue = fillValue;
+    scale.power_down();
   }
 }
 
@@ -146,7 +161,7 @@ bool loadConfiguration() {
 void reconnect() {
   // Loop until we're reconnected
   while (!mqttClient.connected()) {
-    Serial.print("Attempting MQTT connection to "); Serial.print(mqtt_server); Serial.print(":"); Serial.println(mqtt_port);
+    Serial.print("Attempting MQTT connection to "); Serial.print(mqtt_server); Serial.print(":"); Serial.print(mqtt_port); Serial.print("... ");
     // Attempt to connect
     if (mqttClient.connect("WaterBowlClient")) {
       Serial.println("connected");
